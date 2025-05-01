@@ -24,7 +24,7 @@
 #define SERVO_75_DEGREES    (4096 * 1.5 / 20) // 75 degrees (rotate)
 
 // WiFi configuration
-#define WIFI_SSID       "pixel"
+#define WIFI_SSID       "pet_feeder"
 #define WIFI_PASSWORD   "12341234"
 #define MAX_RETRY       5
 
