@@ -20,8 +20,8 @@
 #define SERVO_RESOLUTION    LEDC_TIMER_13_BIT
 
 // Pulse width values for servo positions
-#define SERVO_90_DEGREES    (4096 * 1.5 / 20)  // 90 degrees (center position)
-#define SERVO_75_DEGREES    (4096 * 1.25 / 20) // 75 degrees
+#define SERVO_90_DEGREES    (4096 * 0.5 / 20)  // 90 degrees (center position)
+#define SERVO_75_DEGREES    (4096 * 1.5 / 20) // 75 degrees (rotate)
 
 // WiFi configuration
 #define WIFI_SSID       "pixel"
@@ -30,7 +30,9 @@
 
 static const char *TAG = "automatic_feeder";
 static TimerHandle_t servo_reset_timer = NULL;
+static TimerHandle_t auto_feed_timer = NULL;
 static httpd_handle_t server = NULL;
+static int auto_feed_interval = 0; // In minutes, 0 means disabled
 
 // Initialize servo motor
 static void servo_init(void)
@@ -67,11 +69,30 @@ static void set_servo_position(uint32_t duty)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, SERVO_CHANNEL);
 }
 
+// Execute feeding action
+static void do_feed(void)
+{
+    ESP_LOGI(TAG, "Moving servo to 75 degrees for feeding");
+
+    // Move servo to 75 degrees
+    set_servo_position(SERVO_75_DEGREES);
+
+    // Start timer to reset servo after 5 seconds
+    xTimerReset(servo_reset_timer, 100);
+}
+
 // Timer callback to reset servo to default position
 static void servo_reset_timer_callback(TimerHandle_t xTimer)
 {
     ESP_LOGI(TAG, "Resetting servo to 90 degrees (default position)");
     set_servo_position(SERVO_90_DEGREES);
+}
+
+// Automatic feeding timer callback
+static void auto_feed_timer_callback(TimerHandle_t xTimer)
+{
+    ESP_LOGI(TAG, "Auto feeding triggered");
+    do_feed();
 }
 
 // WiFi event handler
@@ -121,19 +142,83 @@ static void wifi_init_sta(void)
     ESP_LOGI(TAG, "wifi_init_sta finished");
 }
 
+// Update timer interval
+static void update_auto_feed_timer(int minutes)
+{
+    auto_feed_interval = minutes;
+
+    if (auto_feed_timer != NULL) {
+        xTimerStop(auto_feed_timer, 0);
+
+        if (minutes > 0) {
+            // Convert minutes to ticks
+            uint32_t timer_period = pdMS_TO_TICKS(minutes * 60 * 1000);
+
+            xTimerChangePeriod(auto_feed_timer, timer_period, 0);
+            xTimerStart(auto_feed_timer, 0);
+
+            ESP_LOGI(TAG, "Auto feeding timer set to %d minutes", minutes);
+        } else {
+            ESP_LOGI(TAG, "Auto feeding timer disabled");
+        }
+    }
+}
+
 // Feed handler - activates the servo when requested
 static esp_err_t feed_handler(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "Moving servo to 75 degrees for feeding");
-
-    // Move servo to 75 degrees
-    set_servo_position(SERVO_75_DEGREES);
-
-    // Start timer to reset servo after 2 seconds
-    xTimerReset(servo_reset_timer, 100);
+    do_feed();
 
     // Prepare response
-    const char *resp = "Feeding started, servo will reset to 90 degrees in 2 seconds";
+    const char *resp = "Feeding started, servo will reset to 90 degrees in 5 seconds";
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, resp, strlen(resp));
+
+    return ESP_OK;
+}
+
+// Timer setting handler
+static esp_err_t set_timer_handler(httpd_req_t *req)
+{
+    char buf[50];
+    int ret, minutes;
+
+    // Get query string
+    ret = httpd_req_get_url_query_str(req, buf, sizeof(buf));
+    if (ret != ESP_OK) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    char param[32];
+    ret = httpd_query_key_value(buf, "minutes", param, sizeof(param));
+    if (ret != ESP_OK) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    minutes = atoi(param);
+    update_auto_feed_timer(minutes);
+
+    char resp[100];
+    if (minutes > 0) {
+        snprintf(resp, sizeof(resp), "Auto feeding timer set to %d minutes", minutes);
+    } else {
+        snprintf(resp, sizeof(resp), "Auto feeding timer disabled");
+    }
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, resp, strlen(resp));
+
+    return ESP_OK;
+}
+
+// Get current timer status
+static esp_err_t get_timer_status_handler(httpd_req_t *req)
+{
+    char resp[50];
+    snprintf(resp, sizeof(resp), "%d", auto_feed_interval);
+
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_send(req, resp, strlen(resp));
 
@@ -154,6 +239,8 @@ static esp_err_t index_handler(httpd_req_t *req)
                       "                 text-align: center; display: inline-block; font-size: 16px; margin: 4px 2px;\n"
                       "                 cursor: pointer; border-radius: 8px; }\n"
                       "        .status { margin-top: 20px; }\n"
+                      "        .timer-section { margin-top: 40px; padding: 20px; border: 1px solid #ddd; border-radius: 8px; }\n"
+                      "        select, button { padding: 10px; margin: 10px; }\n"
                       "    </style>\n"
                       "</head>\n"
                       "<body>\n"
@@ -161,7 +248,25 @@ static esp_err_t index_handler(httpd_req_t *req)
                       "    <button class='button' id='feedButton'>Feed Now</button>\n"
                       "    <div class='status' id='status'>Ready</div>\n"
                       "\n"
+                      "    <div class='timer-section'>\n"
+                      "        <h2>Auto Feeding Timer</h2>\n"
+                      "        <select id='timerSelect'>\n"
+                      "            <option value='0'>Disabled</option>\n"
+                      "            <option value='30'>30 minutes</option>\n"
+                      "            <option value='60'>1 hour</option>\n"
+                      "            <option value='120'>2 hours</option>\n"
+                      "            <option value='180'>3 hours</option>\n"
+                      "            <option value='240'>4 hours</option>\n"
+                      "            <option value='360'>6 hours</option>\n"
+                      "            <option value='720'>12 hours</option>\n"
+                      "            <option value='1440'>24 hours</option>\n"
+                      "        </select>\n"
+                      "        <button id='setTimerButton'>Set Timer</button>\n"
+                      "        <div id='timerStatus'>Timer not set</div>\n"
+                      "    </div>\n"
+                      "\n"
                       "    <script>\n"
+                      "        // Manual feed button\n"
                       "        document.getElementById('feedButton').addEventListener('click', function() {\n"
                       "            document.getElementById('status').innerHTML = 'Feeding...';\n"
                       "            fetch('/feed')\n"
@@ -176,6 +281,53 @@ static esp_err_t index_handler(httpd_req_t *req)
                       "                    document.getElementById('status').innerHTML = 'Error: ' + error;\n"
                       "                });\n"
                       "        });\n"
+                      "\n"
+                      "        // Get current timer status on page load\n"
+                      "        window.addEventListener('load', function() {\n"
+                      "            fetch('/get_timer')\n"
+                      "                .then(response => response.text())\n"
+                      "                .then(data => {\n"
+                      "                    const minutes = parseInt(data);\n"
+                      "                    document.getElementById('timerSelect').value = minutes;\n"
+                      "                    updateTimerStatus(minutes);\n"
+                      "                })\n"
+                      "                .catch(error => {\n"
+                      "                    console.error('Error fetching timer status:', error);\n"
+                      "                });\n"
+                      "        });\n"
+                      "\n"
+                      "        // Set timer button\n"
+                      "        document.getElementById('setTimerButton').addEventListener('click', function() {\n"
+                      "            const minutes = document.getElementById('timerSelect').value;\n"
+                      "            fetch('/set_timer?minutes=' + minutes)\n"
+                      "                .then(response => response.text())\n"
+                      "                .then(data => {\n"
+                      "                    document.getElementById('status').innerHTML = data;\n"
+                      "                    updateTimerStatus(minutes);\n"
+                      "                    setTimeout(function() {\n"
+                      "                        document.getElementById('status').innerHTML = 'Ready';\n"
+                      "                    }, 3000);\n"
+                      "                })\n"
+                      "                .catch(error => {\n"
+                      "                    document.getElementById('status').innerHTML = 'Error: ' + error;\n"
+                      "                });\n"
+                      "        });\n"
+                      "\n"
+                      "        function updateTimerStatus(minutes) {\n"
+                      "            if (minutes > 0) {\n"
+                      "                let timeText = minutes + ' minutes';\n"
+                      "                if (minutes == 60) timeText = '1 hour';\n"
+                      "                else if (minutes > 60) {\n"
+                      "                    const hours = minutes / 60;\n"
+                      "                    if (hours === Math.floor(hours)) {\n"
+                      "                        timeText = hours + ' hours';\n"
+                      "                    }\n"
+                      "                }\n"
+                      "                document.getElementById('timerStatus').innerHTML = 'Auto feeding every ' + timeText;\n"
+                      "            } else {\n"
+                      "                document.getElementById('timerStatus').innerHTML = 'Auto feeding disabled';\n"
+                      "            }\n"
+                      "        }\n"
                       "    </script>\n"
                       "</body>\n"
                       "</html>";
@@ -197,6 +349,22 @@ static httpd_handle_t start_webserver(void)
         .user_ctx   = NULL
     };
 
+    // Set timer endpoint URI handler
+    httpd_uri_t set_timer = {
+        .uri        = "/set_timer",
+        .method     = HTTP_GET,
+        .handler    = set_timer_handler,
+        .user_ctx   = NULL
+    };
+
+    // Get timer status endpoint URI handler
+    httpd_uri_t get_timer = {
+        .uri        = "/get_timer",
+        .method     = HTTP_GET,
+        .handler    = get_timer_status_handler,
+        .user_ctx   = NULL
+    };
+
     // Main page URI handler
     httpd_uri_t index = {
         .uri        = "/",
@@ -208,6 +376,8 @@ static httpd_handle_t start_webserver(void)
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &index);
         httpd_register_uri_handler(server, &feed);
+        httpd_register_uri_handler(server, &set_timer);
+        httpd_register_uri_handler(server, &get_timer);
         return server;
     }
 
@@ -231,8 +401,12 @@ void app_main(void)
     servo_init();
 
     // Create timer for resetting servo position
-    servo_reset_timer = xTimerCreate("servo_reset_timer", pdMS_TO_TICKS(2000),
+    servo_reset_timer = xTimerCreate("servo_reset_timer", pdMS_TO_TICKS(5000),
                                      pdFALSE, 0, servo_reset_timer_callback);
+
+    // Create auto feeding timer (initially stopped)
+    auto_feed_timer = xTimerCreate("auto_feed_timer", pdMS_TO_TICKS(60 * 60 * 1000), // Default to 1 hour
+                                  pdTRUE, 0, auto_feed_timer_callback);
 
     // Initialize WiFi
     wifi_init_sta();
